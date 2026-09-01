@@ -49,13 +49,16 @@ export default function Command() {
     refresh();
   }, []);
 
+  // `dx stop` also removes the registry entry of a dead service, so this both
+  // stops running services and cleans stopped leftovers out of the list.
   async function stopMany(services: Service[], label: string) {
-    await showToast({ style: Toast.Style.Animated, title: `Stopping ${label}…` });
+    const anyRunning = services.some((s) => s.state === "running");
+    await showToast({ style: Toast.Style.Animated, title: `${anyRunning ? "Stopping" : "Removing"} ${label}…` });
     try {
       for (const svc of services) {
-        if (svc.state === "running") await stopService(svc.name);
+        await stopService(svc.name);
       }
-      await showToast({ style: Toast.Style.Success, title: `Stopped ${label}` });
+      await showToast({ style: Toast.Style.Success, title: `${anyRunning ? "Stopped" : "Removed"} ${label}` });
       await refresh();
     } catch (e) {
       await showToast({ style: Toast.Style.Failure, title: "Stop failed", message: String(e) });
@@ -78,8 +81,8 @@ export default function Command() {
             {env.openSvc.url ? <Action.CopyToClipboard title="Copy URL" content={env.openSvc.url} /> : null}
             {!remote ? (
               <Action
-                title="Stop All in Env"
-                icon={Icon.Stop}
+                title={env.state === "stopped" ? "Remove from List" : "Stop All in Env"}
+                icon={env.state === "stopped" ? Icon.Trash : Icon.Stop}
                 style={Action.Style.Destructive}
                 shortcut={{ modifiers: ["cmd"], key: "x" }}
                 onAction={() => stopMany(env.services, env.openSvc.name)}
@@ -90,7 +93,7 @@ export default function Command() {
                 {env.services.map((svc) => (
                   <Action
                     key={svc.name}
-                    title={`Stop ${svc.key || svc.name}`}
+                    title={`${svc.state === "running" ? "Stop" : "Remove"} ${svc.key || svc.name}`}
                     style={Action.Style.Destructive}
                     onAction={() => stopMany([svc], svc.name)}
                   />
