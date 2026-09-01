@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -286,5 +287,119 @@ func TestRunLogPump_CombinesStreams(t *testing.T) {
 	}
 	if got := string(b); !strings.Contains(got, "out") || !strings.Contains(got, "err") {
 		t.Fatalf("plain log missing combined stdout+stderr: %q", got)
+	}
+}
+
+// fakeSSHStatus swaps sshStatus for the duration of the test.
+func fakeSSHStatus(t *testing.T, fn func(host string) ([]byte, error)) {
+	t.Helper()
+	orig := sshStatus
+	sshStatus = fn
+	t.Cleanup(func() { sshStatus = orig })
+}
+
+func TestRunStatus_RemoteHostJSON(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	reg, _ := registry.Open(registry.StateRoot(os.Getenv), "/home/u/work/myapp")
+	reg.Put(registry.Service{Name: "myapp-api", PID: os.Getpid(), Root: "/home/u/work/myapp", URL: "https://myapp-api.dev.example.com"})
+
+	fakeSSHStatus(t, func(host string) ([]byte, error) {
+		if host != "nano" {
+			t.Fatalf("host=%q", host)
+		}
+		return []byte(`[
+  {"name":"remote-api","root":"/home/r/work/remote","state":"running","pid":42,"url":"https://remote-api.dev.example.com","log":"/tmp/r.log","key":"api","open":true}
+]`), nil
+	})
+
+	var out, errb bytes.Buffer
+	code := runStatus([]string{"--all", "--json", "--host", "nano"}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("code=%d err=%s", code, errb.String())
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries=%d\n%s", len(entries), out.String())
+	}
+	byName := map[string]map[string]any{}
+	for _, e := range entries {
+		byName[e["name"].(string)] = e
+	}
+	// local entry: no host key at all (omitempty)
+	if _, ok := byName["myapp-api"]["host"]; ok {
+		t.Fatalf("local entry has host: %v", byName["myapp-api"])
+	}
+	r := byName["remote-api"]
+	if r["host"] != "nano" || r["state"] != "running" || r["url"] != "https://remote-api.dev.example.com" {
+		t.Fatalf("remote entry = %v", r)
+	}
+	if r["key"] != "api" || r["open"] != true {
+		t.Fatalf("remote key/open = %v/%v", r["key"], r["open"])
+	}
+}
+
+func TestRunStatus_RemoteHostEqualsForm(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	fakeSSHStatus(t, func(host string) ([]byte, error) {
+		return []byte(`[{"name":"remote-api","root":"/r","state":"stopped","pid":0,"url":"","log":""}]`), nil
+	})
+	var out, errb bytes.Buffer
+	if code := runStatus([]string{"--all", "--json", "--host=nano"}, &out, &errb); code != 0 {
+		t.Fatalf("code=%d err=%s", code, errb.String())
+	}
+	if !strings.Contains(out.String(), `"host": "nano"`) {
+		t.Fatalf("missing host field:\n%s", out.String())
+	}
+}
+
+func TestRunStatus_RemoteHostFailure(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	reg, _ := registry.Open(registry.StateRoot(os.Getenv), "/home/u/work/myapp")
+	reg.Put(registry.Service{Name: "myapp-api", PID: os.Getpid(), Root: "/home/u/work/myapp"})
+
+	fakeSSHStatus(t, func(host string) ([]byte, error) {
+		return nil, fmt.Errorf("ssh: connect refused")
+	})
+
+	var out, errb bytes.Buffer
+	code := runStatus([]string{"--all", "--json", "--host", "nano"}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("code=%d (remote failure must not fail the whole status)", code)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	if len(entries) != 1 || entries[0]["name"] != "myapp-api" {
+		t.Fatalf("local entries lost: %v", entries)
+	}
+	if !strings.Contains(errb.String(), "nano") {
+		t.Fatalf("stderr should mention the failing host: %q", errb.String())
+	}
+}
+
+func TestRunStatus_HostMissingValue(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := runStatus([]string{"--all", "--host"}, &out, &errb); code != 2 {
+		t.Fatalf("code=%d, want 2 (usage error)", code)
+	}
+}
+
+func TestRunStatus_RemoteTextGrouping(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	fakeSSHStatus(t, func(host string) ([]byte, error) {
+		return []byte(`[{"name":"remote-api","root":"/home/r/work/remote","state":"running","pid":42,"url":"https://r.example.com","log":""}]`), nil
+	})
+	var out, errb bytes.Buffer
+	if code := runStatus([]string{"--all", "--host", "nano"}, &out, &errb); code != 0 {
+		t.Fatalf("code=%d err=%s", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "nano:/home/r/work/remote") {
+		t.Fatalf("remote root header not host-prefixed:\n%s", out.String())
 	}
 }

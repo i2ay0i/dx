@@ -58,20 +58,21 @@ export default function Command() {
     }
   }
 
-  return (
-    <List isLoading={loading}>
-      <List.EmptyView title="No dx services" description="起動中の dx サービスはありません" />
-      {envs.map((env) => (
-        <List.Item
-          key={env.root}
-          icon={{ source: Icon.CircleFilled, tintColor: stateColor[env.state] }}
-          title={env.openSvc.name}
-          subtitle={tilde(env.root)}
-          accessories={dots(env)}
-          actions={
-            <ActionPanel>
-              {env.openSvc.url ? <Action.OpenInBrowser url={env.openSvc.url} /> : null}
-              {env.openSvc.url ? <Action.CopyToClipboard title="Copy URL" content={env.openSvc.url} /> : null}
+  // Remote envs (from `dx status --host`) are read-only: open/copy URL, no stop.
+  function envItem(env: Env) {
+    const remote = Boolean(env.host);
+    return (
+      <List.Item
+        key={`${env.host ?? ""}:${env.root}`}
+        icon={{ source: Icon.CircleFilled, tintColor: stateColor[env.state] }}
+        title={env.openSvc.name}
+        subtitle={tilde(env.root)}
+        accessories={dots(env)}
+        actions={
+          <ActionPanel>
+            {env.openSvc.url ? <Action.OpenInBrowser url={env.openSvc.url} /> : null}
+            {env.openSvc.url ? <Action.CopyToClipboard title="Copy URL" content={env.openSvc.url} /> : null}
+            {!remote ? (
               <Action
                 title="Stop All in Env"
                 icon={Icon.Stop}
@@ -79,6 +80,8 @@ export default function Command() {
                 shortcut={{ modifiers: ["cmd"], key: "x" }}
                 onAction={() => stopMany(env.services, env.openSvc.name)}
               />
+            ) : null}
+            {!remote ? (
               <ActionPanel.Submenu title="Stop Service…" icon={Icon.StopFilled}>
                 {env.services.map((svc) => (
                   <Action
@@ -89,15 +92,30 @@ export default function Command() {
                   />
                 ))}
               </ActionPanel.Submenu>
-              <Action
-                title="Refresh"
-                icon={Icon.ArrowClockwise}
-                shortcut={{ modifiers: ["cmd"], key: "r" }}
-                onAction={refresh}
-              />
-            </ActionPanel>
-          }
-        />
+            ) : null}
+            <Action
+              title="Refresh"
+              icon={Icon.ArrowClockwise}
+              shortcut={{ modifiers: ["cmd"], key: "r" }}
+              onAction={refresh}
+            />
+          </ActionPanel>
+        }
+      />
+    );
+  }
+
+  const locals = envs.filter((e) => !e.host);
+  const hosts = [...new Set(envs.filter((e) => e.host).map((e) => e.host as string))];
+
+  return (
+    <List isLoading={loading}>
+      <List.EmptyView title="No dx services" description="起動中の dx サービスはありません" />
+      {locals.map(envItem)}
+      {hosts.map((host) => (
+        <List.Section key={host} title={host}>
+          {envs.filter((e) => e.host === host).map(envItem)}
+        </List.Section>
       ))}
     </List>
   );

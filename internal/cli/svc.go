@@ -154,6 +154,22 @@ func runDown(stdout, stderr io.Writer) int {
 	return downRegistry(reg, stdout, stderr)
 }
 
+// sshStatus fetches `dx status --all --json` from a remote host over ssh.
+// The PATH prefix covers the usual install location (~/.local/bin), which
+// non-interactive ssh shells typically do not have on PATH.
+// Package var so tests can fake the ssh hop.
+var sshStatus = func(host string) ([]byte, error) {
+	cmd := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "--",
+		`PATH="$HOME/.local/bin:$PATH" dx status --all --json`)
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(errBuf.String()))
+	}
+	return out, nil
+}
+
 type statusEntry struct {
 	Name  string `json:"name"`
 	Root  string `json:"root"`
@@ -163,16 +179,43 @@ type statusEntry struct {
 	Log   string `json:"log"`
 	Key   string `json:"key"`
 	Open  bool   `json:"open"`
+	Host  string `json:"host,omitempty"` // ssh host the service runs on; empty = local
+}
+
+// remoteEntries fetches and tags one remote host's services.
+func remoteEntries(host string) ([]statusEntry, error) {
+	out, err := sshStatus(host)
+	if err != nil {
+		return nil, err
+	}
+	var entries []statusEntry
+	if err := json.Unmarshal(out, &entries); err != nil {
+		return nil, fmt.Errorf("parse remote status: %w", err)
+	}
+	for i := range entries {
+		entries[i].Host = host
+	}
+	return entries, nil
 }
 
 func runStatus(args []string, stdout, stderr io.Writer) int {
 	all, asJSON := false, false
-	for _, a := range args {
-		switch a {
-		case "--all", "-a":
+	var hosts []string
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case a == "--all" || a == "-a":
 			all = true
-		case "--json":
+		case a == "--json":
 			asJSON = true
+		case a == "--host":
+			if i+1 >= len(args) {
+				fmt.Fprintln(stderr, "usage: dx status [--all] [--json] [--host <ssh-host>]...")
+				return 2
+			}
+			i++
+			hosts = append(hosts, args[i])
+		case strings.HasPrefix(a, "--host="):
+			hosts = append(hosts, strings.TrimPrefix(a, "--host="))
 		}
 	}
 
@@ -213,6 +256,18 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		})
 	}
 
+	// Remote hosts: a failing host is a warning, not a failure — local (and
+	// other hosts') results still come back, so e.g. the Raycast list keeps
+	// working when one machine is asleep.
+	for _, h := range hosts {
+		re, err := remoteEntries(h)
+		if err != nil {
+			fmt.Fprintf(stderr, "warning: host %s: %v\n", h, err)
+			continue
+		}
+		entries = append(entries, re...)
+	}
+
 	if asJSON {
 		data, err := json.MarshalIndent(entries, "", "  ")
 		if err != nil {
@@ -233,20 +288,24 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if all {
-		// group by Root
+		// group by (host, root); remote roots are prefixed "host:"
 		seen := map[string]bool{}
 		for _, e := range entries {
-			if seen[e.Root] {
+			key := e.Host + "\x00" + e.Root
+			if seen[key] {
 				continue
 			}
-			seen[e.Root] = true
+			seen[key] = true
 			root := e.Root
 			if root == "" {
 				root = "(unknown checkout)"
 			}
+			if e.Host != "" {
+				root = e.Host + ":" + root
+			}
 			fmt.Fprintln(stdout, root)
 			for _, f := range entries {
-				if f.Root == e.Root {
+				if f.Host == e.Host && f.Root == e.Root {
 					fmt.Fprintf(stdout, "  %-26s %-8s pid=%-7d %s\n", f.Name, f.State, f.PID, f.URL)
 				}
 			}

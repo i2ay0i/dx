@@ -9,7 +9,9 @@
 
 type ExtensionPreferences = {
   /** dx binary path - Path to the dx CLI */
-  "dxPath": string
+  "dxPath": string,
+  /** Remote hosts - Comma-separated ssh hosts whose dx services to also list (e.g. nano). dx must be installed on each host. */
+  "remoteHosts": string
 }
 
 /** Preferences accessible in all the extension's commands */

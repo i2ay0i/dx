@@ -15,8 +15,19 @@ function dxBin(): string {
   return raw.startsWith("~") ? raw.replace(/^~/, homedir()) : raw;
 }
 
+// remoteHosts preference: comma/space separated ssh hosts (e.g. "nano").
+function remoteHosts(): string[] {
+  const { remoteHosts } = getPreferenceValues<{ remoteHosts?: string }>();
+  return (remoteHosts ?? "")
+    .split(/[,\s]+/)
+    .map((h) => h.trim())
+    .filter(Boolean);
+}
+
 export async function listServices(): Promise<Service[]> {
-  const { stdout } = await pExecFile(dxBin(), ["status", "--all", "--json"]);
+  const args = ["status", "--all", "--json"];
+  for (const h of remoteHosts()) args.push("--host", h);
+  const { stdout } = await pExecFile(dxBin(), args);
   const parsed = JSON.parse(stdout || "[]");
   return Array.isArray(parsed) ? (parsed as Service[]) : [];
 }

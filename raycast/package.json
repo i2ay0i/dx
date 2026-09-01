@@ -22,6 +22,14 @@
       "type": "textfield",
       "required": false,
       "default": "~/.local/bin/dx"
+    },
+    {
+      "name": "remoteHosts",
+      "title": "Remote hosts",
+      "description": "Comma-separated ssh hosts whose dx services to also list (e.g. nano). dx must be installed on each host.",
+      "type": "textfield",
+      "required": false,
+      "default": ""
     }
   ],
   "dependencies": {

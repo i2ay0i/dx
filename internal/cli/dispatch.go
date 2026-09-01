@@ -18,7 +18,9 @@ COMMANDS:
   up                          start every [service.<key>] from dx.toml (background, idempotent)
   down                        stop this checkout's dev services
   serve <key>                 start one service from dx.toml
-  status [--all] [--json]     service status (--all = across all checkouts)
+  status [--all] [--json] [--host <ssh-host>]...
+                              service status (--all = across all checkouts,
+                              --host = also include a remote machine's services via ssh)
   stop <name|key>             stop a service (global)
   logs [name|key] [-f] [-t] [--no-color]
                               tail logs, colored per-service prefix; -f to follow
@@ -103,14 +105,19 @@ NOTES:
 const statusHelp = `dx status — show service status
 
 USAGE:
-  dx status [--all] [--json]
+  dx status [--all] [--json] [--host <ssh-host>]...
 
 FLAGS:
-  --all, -a    show services across all checkouts (not just current)
-  --json       output as JSON array
+  --all, -a       show services across all checkouts (not just current)
+  --json          output as JSON array
+  --host <host>   also include services running on <host> (repeatable).
+                  Runs 'dx status --all --json' there over ssh (BatchMode,
+                  5s connect timeout); dx must be installed on the host.
+                  An unreachable host is a warning on stderr, not an error.
 
 FIELDS (JSON):
-  name, root, state (running|stopped), pid, url, log
+  name, root, state (running|stopped), pid, url, log, key, open,
+  host (only on entries fetched from a --host machine)
 `
 
 const stopHelp = `dx stop — stop a service by name or config key
