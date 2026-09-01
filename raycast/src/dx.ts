@@ -24,12 +24,21 @@ function remoteHosts(): string[] {
     .filter(Boolean);
 }
 
-export async function listServices(): Promise<Service[]> {
+export interface StatusResult {
+  services: Service[];
+  // dx's stderr — e.g. "warning: host nano: ..." when a remote host is unreachable.
+  warning?: string;
+}
+
+export async function listServices(): Promise<StatusResult> {
   const args = ["status", "--all", "--json"];
   for (const h of remoteHosts()) args.push("--host", h);
-  const { stdout } = await pExecFile(dxBin(), args);
+  const { stdout, stderr } = await pExecFile(dxBin(), args);
   const parsed = JSON.parse(stdout || "[]");
-  return Array.isArray(parsed) ? (parsed as Service[]) : [];
+  return {
+    services: Array.isArray(parsed) ? (parsed as Service[]) : [],
+    warning: stderr.trim() || undefined,
+  };
 }
 
 export async function stopService(name: string): Promise<void> {

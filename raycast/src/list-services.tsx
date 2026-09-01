@@ -33,7 +33,11 @@ export default function Command() {
   async function refresh() {
     setLoading(true);
     try {
-      setEnvs(groupByRoot(await listServices()));
+      const { services, warning } = await listServices();
+      setEnvs(groupByRoot(services));
+      if (warning) {
+        await showToast({ style: Toast.Style.Failure, title: "dx status warning", message: warning });
+      }
     } catch (e) {
       await showToast({ style: Toast.Style.Failure, title: "dx status failed", message: String(e) });
     } finally {

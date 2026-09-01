@@ -154,12 +154,22 @@ func runDown(stdout, stderr io.Writer) int {
 	return downRegistry(reg, stdout, stderr)
 }
 
+// sshBin resolves the ssh binary: PATH lookup first, /usr/bin/ssh as fallback.
+// GUI-launched processes (e.g. Raycast running the dx extension) have a PATH
+// without /usr/bin, so a bare "ssh" would fail with "executable not found".
+func sshBin() string {
+	if p, err := exec.LookPath("ssh"); err == nil {
+		return p
+	}
+	return "/usr/bin/ssh"
+}
+
 // sshStatus fetches `dx status --all --json` from a remote host over ssh.
 // The PATH prefix covers the usual install location (~/.local/bin), which
 // non-interactive ssh shells typically do not have on PATH.
 // Package var so tests can fake the ssh hop.
 var sshStatus = func(host string) ([]byte, error) {
-	cmd := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "--",
+	cmd := exec.Command(sshBin(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "--",
 		`PATH="$HOME/.local/bin:$PATH" dx status --all --json`)
 	var errBuf strings.Builder
 	cmd.Stderr = &errBuf

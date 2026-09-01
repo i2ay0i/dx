@@ -403,3 +403,10 @@ func TestRunStatus_RemoteTextGrouping(t *testing.T) {
 		t.Fatalf("remote root header not host-prefixed:\n%s", out.String())
 	}
 }
+
+func TestSSHBin_FallsBackWithoutPATH(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no ssh here
+	if got := sshBin(); got != "/usr/bin/ssh" {
+		t.Fatalf("sshBin()=%q, want /usr/bin/ssh when PATH has no ssh", got)
+	}
+}
