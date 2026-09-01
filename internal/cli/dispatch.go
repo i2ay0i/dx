@@ -24,7 +24,7 @@ COMMANDS:
                               tail logs, colored per-service prefix; -f to follow
   exec <key> [--] <cmd...>    run a command with <key>'s env (URLs + db_env) and dir
   db <sub>                    DB: up|down|psql|fork|drop|reset|list|url [--scheme <s>]
-  worktree <sub>              worktree: create|rm|list (alias: wt)
+  worktree <sub>              worktree: create|adopt|rm|list (alias: wt)
   raycast <sub>               Raycast extension: install|uninstall
   update [--force]            self-update to the latest GitHub release
   version                     print version
@@ -39,7 +39,8 @@ LOGS:
 
 WORKTREE:
   dx worktree create <branch> [--from <base>] [--skip-init]
-  dx worktree rm <branch> [--force] [--keep-db] [--delete-branch]
+  dx worktree adopt [--skip-init]        (inside a worktree created by another tool)
+  dx worktree rm <branch> [--force] [--keep-db] [--keep-worktree] [--delete-branch]
   dx worktree list [--json]
 
 DB (config from dx.toml [db]):
@@ -173,10 +174,26 @@ SUBCOMMANDS:
       --skip-init    skip the configured init steps (copy still runs)
       Exit: 0 = ready, 3 = worktree kept but DB fork or init failed, 1 = abort.
 
-  rm <branch> [--force] [--keep-db] [--delete-branch]
+  adopt [--skip-init]
+      Everything 'create' does except 'git worktree add': DB fork, [[worktree.copy]]
+      files, then [[worktree.init]] steps — against the worktree you are standing in.
+      For worktrees created by another tool (e.g. an Orca setup hook), so that
+      dx.toml stays the single source of truth. Runs from inside the worktree only;
+      takes no branch argument (the current branch is the target).
+      Idempotent — safe to re-run: an existing DB is not re-forked, existing copy
+      destinations are kept, init steps re-run.
+      --skip-init    skip the configured init steps (copy still runs)
+      Exit: same as create — 0 = ready, 3 = DB fork/copy/init failed, 1 = abort.
+
+  rm <branch> [--force] [--keep-db] [--keep-worktree] [--delete-branch]
       Remove worktree, its DB fork (unless --keep-db), and its services.
       --force          proceed even if the worktree has uncommitted changes
       --keep-db        skip DB drop
+      --keep-worktree  stop services and drop the DB only; leave the checkout and
+                       the branch in place (for a tool that removes them itself,
+                       e.g. an Orca archive hook). Skips the dirty check, and is
+                       the one form of 'rm' that also runs from inside the worktree.
+                       Cannot be combined with --delete-branch.
       --delete-branch  also delete the git branch after removal
 
   list [--json]
@@ -199,6 +216,7 @@ CONFIG ([worktree] in dx.toml at repo root):
 
 ORDER after 'create':
   git worktree add → DB fork → copy → init (fail-fast, worktree kept on failure)
+  'adopt' runs the same steps minus 'git worktree add'.
 
 ENV passed to each init step:
   DX_WORKTREE_BRANCH  new branch name

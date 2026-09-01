@@ -449,3 +449,408 @@ func TestListRows_DBAndServices(t *testing.T) {
 		t.Fatalf("services = %v", rows[1].Services)
 	}
 }
+
+// --- adopt: git worktree add を伴わない後半3ステップ ---
+
+func baseAdoptDeps(cfg *project.Config) wtDeps {
+	d := baseDeps(cfg)
+	d.Git = func(args ...string) (string, error) {
+		return "", fmt.Errorf("adopt must not run git: %v", args)
+	}
+	return d
+}
+
+func TestAdopt_NoGitWorktreeAdd(t *testing.T) {
+	d := baseAdoptDeps(&project.Config{})
+	var calls []string
+	d.Git = func(args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return "", nil
+	}
+	rc := adoptWorktree(adoptOpts{Branch: "feat-a", Path: "/wt/feat-a"}, d)
+	if rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("adopt must not invoke git, got %v", calls)
+	}
+}
+
+func TestAdopt_NoDBExitsZero(t *testing.T) {
+	rc := adoptWorktree(adoptOpts{Branch: "feat-b", Path: "/wt/feat-b"}, baseAdoptDeps(&project.Config{}))
+	if rc != 0 {
+		t.Fatalf("no-DB adopt should be rc=0, got %d", rc)
+	}
+}
+
+func TestAdopt_URLEnvUnsetExits3(t *testing.T) {
+	cfg := &project.Config{DB: &project.DB{Container: "c", URLEnv: "APP_DATABASE_URL"}}
+	d := baseAdoptDeps(cfg)
+	d.Getenv = func(string) string { return "" }
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-c", Path: "/wt/feat-c"}, d); rc != 3 {
+		t.Fatalf("url_env unset should be rc=3, got %d", rc)
+	}
+}
+
+func TestAdopt_ContainerDownExits3(t *testing.T) {
+	cfg := &project.Config{DB: &project.DB{Container: "c", URLEnv: "APP_DATABASE_URL"}}
+	d := baseAdoptDeps(cfg)
+	d.ContainerRunning = func(string) bool { return false }
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-d", Path: "/wt/feat-d"}, d); rc != 3 {
+		t.Fatalf("container down should be rc=3, got %d", rc)
+	}
+}
+
+func TestAdopt_ForkFailureExits3(t *testing.T) {
+	cfg := &project.Config{DB: &project.DB{Container: "c", URLEnv: "APP_DATABASE_URL"}}
+	d := baseAdoptDeps(cfg)
+	d.Docker = func(string, ...string) (string, error) { return "", fmt.Errorf("boom") }
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-e", Path: "/wt/feat-e"}, d); rc != 3 {
+		t.Fatalf("fork failure should be rc=3, got %d", rc)
+	}
+}
+
+func TestAdopt_ForksIntoBranchDB(t *testing.T) {
+	cfg := &project.Config{DB: &project.DB{Container: "c", Dsn: "postgresql://u:p@h:5432/myapp"}}
+	d := baseAdoptDeps(cfg)
+	var sql []string
+	d.Docker = func(_ string, args ...string) (string, error) {
+		sql = append(sql, strings.Join(args, " "))
+		return "", nil
+	}
+	if rc := adoptWorktree(adoptOpts{Branch: "feat/x", Path: "/wt/feat-x"}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if !strings.Contains(strings.Join(sql, "|"), "myapp_feat_x") {
+		t.Fatalf("expected fork into myapp_feat_x, docker calls: %v", sql)
+	}
+}
+
+// 既存 DB があれば fork は走らない（フックの再実行で壊れないこと）。
+func TestAdopt_ExistingDBSkipsFork(t *testing.T) {
+	cfg := &project.Config{DB: &project.DB{Container: "c", Dsn: "postgresql://u:p@h:5432/myapp"}}
+	d := baseAdoptDeps(cfg)
+	var sql []string
+	d.Docker = func(_ string, args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		sql = append(sql, joined)
+		if strings.Contains(joined, "pg_database") {
+			return "1\n", nil // 既に存在
+		}
+		return "", nil
+	}
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-idem", Path: "/wt/feat-idem"}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	for _, c := range sql {
+		if strings.Contains(c, "CREATE DATABASE") {
+			t.Fatalf("existing DB must not be re-created, docker calls: %v", sql)
+		}
+	}
+}
+
+func TestAdopt_CopyThenInitWithGivenPath(t *testing.T) {
+	cfg := &project.Config{Worktree: project.Worktree{
+		Copy: []project.CopyStep{{From: ".env"}},
+		Init: []project.InitStep{{Command: []string{"true"}}},
+	}}
+	d := baseAdoptDeps(cfg)
+	order := []string{}
+	d.RunCopy = func(_ []project.CopyStep, primaryRoot, worktreeRoot string, _, _ io.Writer) error {
+		order = append(order, "copy")
+		if primaryRoot != "/repo" || worktreeRoot != "/elsewhere/feat-p" {
+			t.Fatalf("copy roots: primary=%q worktree=%q", primaryRoot, worktreeRoot)
+		}
+		return nil
+	}
+	d.RunInit = func(_ []project.InitStep, root, branch, primaryRoot string, _, _ io.Writer) error {
+		order = append(order, "init")
+		if root != "/elsewhere/feat-p" || branch != "feat-p" || primaryRoot != "/repo" {
+			t.Fatalf("init args: root=%q branch=%q primary=%q", root, branch, primaryRoot)
+		}
+		return nil
+	}
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-p", Path: "/elsewhere/feat-p"}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if len(order) != 2 || order[0] != "copy" || order[1] != "init" {
+		t.Fatalf("order = %v, want [copy init]", order)
+	}
+}
+
+func TestAdopt_CopyFailureExits3(t *testing.T) {
+	cfg := &project.Config{Worktree: project.Worktree{Copy: []project.CopyStep{{From: ".env"}}}}
+	d := baseAdoptDeps(cfg)
+	d.RunCopy = func([]project.CopyStep, string, string, io.Writer, io.Writer) error {
+		return fmt.Errorf("boom")
+	}
+	initCalled := false
+	d.RunInit = func([]project.InitStep, string, string, string, io.Writer, io.Writer) error {
+		initCalled = true
+		return nil
+	}
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-cf", Path: "/wt/feat-cf"}, d); rc != 3 {
+		t.Fatalf("copy failure should be rc=3, got %d", rc)
+	}
+	if initCalled {
+		t.Fatal("init must not run after copy failure")
+	}
+}
+
+func TestAdopt_InitFailureExits3(t *testing.T) {
+	cfg := &project.Config{Worktree: project.Worktree{Init: []project.InitStep{{Command: []string{"false"}}}}}
+	d := baseAdoptDeps(cfg)
+	d.RunInit = func([]project.InitStep, string, string, string, io.Writer, io.Writer) error {
+		return fmt.Errorf("boom")
+	}
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-if", Path: "/wt/feat-if"}, d); rc != 3 {
+		t.Fatalf("init failure should be rc=3, got %d", rc)
+	}
+}
+
+func TestAdopt_SkipInitStillCopies(t *testing.T) {
+	cfg := &project.Config{Worktree: project.Worktree{
+		Copy: []project.CopyStep{{From: ".env"}},
+		Init: []project.InitStep{{Command: []string{"true"}}},
+	}}
+	d := baseAdoptDeps(cfg)
+	copyCalled, initCalled := false, false
+	d.RunCopy = func([]project.CopyStep, string, string, io.Writer, io.Writer) error {
+		copyCalled = true
+		return nil
+	}
+	d.RunInit = func([]project.InitStep, string, string, string, io.Writer, io.Writer) error {
+		initCalled = true
+		return nil
+	}
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-si", Path: "/wt/feat-si", SkipInit: true}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if !copyCalled {
+		t.Fatal("copy should still run with SkipInit")
+	}
+	if initCalled {
+		t.Fatal("init must not run with SkipInit")
+	}
+}
+
+// 二重実行しても壊れない（DB 既存 / copy 宛先既存 / init 再実行）。
+func TestAdopt_RerunStaysReady(t *testing.T) {
+	cfg := &project.Config{
+		DB: &project.DB{Container: "c", Dsn: "postgresql://u:p@h:5432/myapp"},
+		Worktree: project.Worktree{
+			Copy: []project.CopyStep{{From: ".env"}},
+			Init: []project.InitStep{{Command: []string{"true"}}},
+		},
+	}
+	d := baseAdoptDeps(cfg)
+	d.Docker = func(_ string, args ...string) (string, error) {
+		if strings.Contains(strings.Join(args, " "), "pg_database") {
+			return "1\n", nil
+		}
+		return "", nil
+	}
+	initRuns := 0
+	d.RunCopy = func([]project.CopyStep, string, string, io.Writer, io.Writer) error { return nil }
+	d.RunInit = func([]project.InitStep, string, string, string, io.Writer, io.Writer) error {
+		initRuns++
+		return nil
+	}
+	o := adoptOpts{Branch: "feat-re", Path: "/wt/feat-re"}
+	if rc := adoptWorktree(o, d); rc != 0 {
+		t.Fatalf("first run rc=%d", rc)
+	}
+	if rc := adoptWorktree(o, d); rc != 0 {
+		t.Fatalf("second run rc=%d", rc)
+	}
+	if initRuns != 2 {
+		t.Fatalf("init should re-run on every adopt, runs=%d", initRuns)
+	}
+}
+
+// primary root は `git worktree list --porcelain` の先頭エントリ。
+func TestPrimaryRootFrom(t *testing.T) {
+	porc := "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /elsewhere/feat-x\nHEAD def\nbranch refs/heads/feat-x\n"
+	got, err := primaryRootFrom(func(...string) (string, error) { return porc, nil })
+	if err != nil || got != "/repo" {
+		t.Fatalf("primaryRootFrom = %q, err=%v", got, err)
+	}
+}
+
+func TestPrimaryRootFrom_EmptyErrors(t *testing.T) {
+	if _, err := primaryRootFrom(func(...string) (string, error) { return "", nil }); err == nil {
+		t.Fatal("expected error for empty porcelain output")
+	}
+}
+
+// 自分自身は slug 衝突とみなさない（adopt は既存 worktree が対象）。
+func TestAdopt_SelfIsNotACollision(t *testing.T) {
+	d := baseAdoptDeps(&project.Config{})
+	d.Existing = []string{"main", "feat-self"}
+	if rc := adoptWorktree(adoptOpts{Branch: "feat-self", Path: "/wt/feat-self"}, d); rc != 0 {
+		t.Fatalf("own branch must not count as a collision, rc=%d", rc)
+	}
+}
+
+func TestAdopt_OtherBranchCollisionAborts(t *testing.T) {
+	d := baseAdoptDeps(&project.Config{})
+	d.Existing = []string{"main", "feat-x"}
+	if rc := adoptWorktree(adoptOpts{Branch: "feat/x", Path: "/wt/feat-x"}, d); rc != 1 {
+		t.Fatalf("collision with another branch should abort with rc=1, got %d", rc)
+	}
+}
+
+// --- rm --keep-worktree ---
+
+func TestRm_KeepWorktreeSkipsGitRemove(t *testing.T) {
+	cfg := &project.Config{DB: &project.DB{Container: "c", URLEnv: "APP_DATABASE_URL"}}
+	d := baseRmDeps(cfg)
+	var calls []string
+	d.Git = func(args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return "", nil
+	}
+	dropped := false
+	d.Docker = func(string, ...string) (string, error) { dropped = true; return "", nil }
+	if rc := rmWorktree(rmOpts{Branch: "feat-x", KeepWorktree: true}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if strings.Contains(strings.Join(calls, "|"), "worktree remove") {
+		t.Fatalf("--keep-worktree must not remove the worktree, git calls: %v", calls)
+	}
+	if !dropped {
+		t.Fatal("--keep-worktree must still drop the DB")
+	}
+}
+
+func TestRm_KeepWorktreeStopsServices(t *testing.T) {
+	d := baseRmDeps(&project.Config{})
+	stopped := false
+	d.StopServices = func(string) error { stopped = true; return nil }
+	if rc := rmWorktree(rmOpts{Branch: "feat-x", KeepWorktree: true}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if !stopped {
+		t.Fatal("--keep-worktree must still stop services")
+	}
+}
+
+// worktree を消さないので dirty 保護は不要（archive フックが毎回落ちるのを防ぐ）。
+func TestRm_KeepWorktreeIgnoresDirty(t *testing.T) {
+	d := baseRmDeps(&project.Config{})
+	d.Dirty = func(string) bool { return true }
+	if rc := rmWorktree(rmOpts{Branch: "feat-x", KeepWorktree: true}, d); rc != 0 {
+		t.Fatalf("--keep-worktree should not require --force on a dirty worktree, rc=%d", rc)
+	}
+}
+
+func TestRm_KeepWorktreeKeepsBranch(t *testing.T) {
+	d := baseRmDeps(&project.Config{})
+	var calls []string
+	d.Git = func(args ...string) (string, error) {
+		calls = append(calls, strings.Join(args, " "))
+		return "", nil
+	}
+	if rc := rmWorktree(rmOpts{Branch: "feat-x", KeepWorktree: true, DeleteBranch: true}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if strings.Contains(strings.Join(calls, "|"), "branch -d") {
+		t.Fatalf("--keep-worktree must not delete the branch, git calls: %v", calls)
+	}
+}
+
+func TestRm_KeepWorktreeDropFailureAborts(t *testing.T) {
+	cfg := &project.Config{DB: &project.DB{Container: "c", URLEnv: "APP_DATABASE_URL"}}
+	d := baseRmDeps(cfg)
+	d.Docker = func(string, ...string) (string, error) { return "", fmt.Errorf("drop boom") }
+	if rc := rmWorktree(rmOpts{Branch: "feat-x", KeepWorktree: true}, d); rc != 1 {
+		t.Fatalf("drop failure should abort, rc=%d", rc)
+	}
+}
+
+// --- rm の対象パス解決 ---
+
+// Orca が作る worktree は <primary>/<worktree.dir>/<branch> にないので、
+// 呼び出し側が解決したパスを使う。
+func TestRm_UsesGivenPath(t *testing.T) {
+	d := baseRmDeps(&project.Config{Worktree: project.Worktree{Dir: ".claude/worktrees"}})
+	var dirtyPath, topPath string
+	d.Dirty = func(p string) bool { dirtyPath = p; return false }
+	d.Toplevel = func(p string) (string, error) { topPath = p; return p, nil }
+	if rc := rmWorktree(rmOpts{Branch: "feat-x", Path: "/elsewhere/wt/feat-x"}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	if dirtyPath != "/elsewhere/wt/feat-x" || topPath != "/elsewhere/wt/feat-x" {
+		t.Fatalf("dirty=%q toplevel=%q, want the given path", dirtyPath, topPath)
+	}
+}
+
+func TestRm_FallsBackToConfiguredPath(t *testing.T) {
+	d := baseRmDeps(&project.Config{Worktree: project.Worktree{Dir: ".claude/worktrees"}})
+	var dirtyPath string
+	d.Dirty = func(p string) bool { dirtyPath = p; return false }
+	if rc := rmWorktree(rmOpts{Branch: "feat-x"}, d); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	want := filepath.Join("/repo", ".claude/worktrees", "feat-x")
+	if dirtyPath != want {
+		t.Fatalf("dirty path = %q, want %q", dirtyPath, want)
+	}
+}
+
+func TestWorktreePathFor(t *testing.T) {
+	porc := "worktree /repo\nbranch refs/heads/main\n\nworktree /elsewhere/feat-x\nbranch refs/heads/feat-x\n"
+	if got, ok := worktreePathFor(porc, "feat-x"); !ok || got != "/elsewhere/feat-x" {
+		t.Fatalf("worktreePathFor = %q, %v", got, ok)
+	}
+	if _, ok := worktreePathFor(porc, "nope"); ok {
+		t.Fatal("unknown branch must report not found")
+	}
+}
+
+// --- サブコマンド引数の解析 ---
+
+func TestParseRmArgs_KeepWorktree(t *testing.T) {
+	o, err := parseRmArgs([]string{"feat-x", "--keep-worktree"})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if o.Branch != "feat-x" || !o.KeepWorktree {
+		t.Fatalf("opts = %+v", o)
+	}
+}
+
+func TestParseRmArgs_KeepWorktreeIsOrthogonalToKeepDB(t *testing.T) {
+	o, err := parseRmArgs([]string{"feat-x", "--keep-worktree", "--keep-db"})
+	if err != nil || !o.KeepWorktree || !o.KeepDB {
+		t.Fatalf("opts = %+v, err=%v", o, err)
+	}
+}
+
+// 「worktree は残す」と「ブランチを消す」は意図が矛盾する。
+func TestParseRmArgs_KeepWorktreeWithDeleteBranchErrors(t *testing.T) {
+	if _, err := parseRmArgs([]string{"feat-x", "--keep-worktree", "--delete-branch"}); err == nil {
+		t.Fatal("expected an error for --keep-worktree with --delete-branch")
+	}
+}
+
+func TestParseAdoptArgs_SkipInit(t *testing.T) {
+	skipInit, err := parseAdoptArgs([]string{"--skip-init"})
+	if err != nil || !skipInit {
+		t.Fatalf("skipInit=%v err=%v", skipInit, err)
+	}
+}
+
+func TestParseAdoptArgs_Bare(t *testing.T) {
+	skipInit, err := parseAdoptArgs(nil)
+	if err != nil || skipInit {
+		t.Fatalf("skipInit=%v err=%v", skipInit, err)
+	}
+}
+
+// adopt は cwd の worktree を対象にするので位置引数を取らない。
+func TestParseAdoptArgs_RejectsPositional(t *testing.T) {
+	if _, err := parseAdoptArgs([]string{"feat-x"}); err == nil {
+		t.Fatal("expected an error for a positional argument")
+	}
+}

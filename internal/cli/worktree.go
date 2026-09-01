@@ -39,7 +39,9 @@ type wtDeps struct {
 }
 
 // createWorktree performs `dx worktree create` and returns the exit code.
-// 0=ready, 3=worktree created but DB pending, 1=failure.
+// It only adds the git worktree; the DB fork / copy / init steps are shared
+// with `dx worktree adopt` via adoptWorktree.
+// 0=ready, 3=worktree created but a follow-up step failed, 1=failure.
 func createWorktree(o createOpts, d wtDeps) int {
 	// collision (DB name) check
 	if with, ok := worktree.SlugCollision(o.Branch, d.Existing); ok {
@@ -65,21 +67,48 @@ func createWorktree(o createOpts, d wtDeps) int {
 		fmt.Fprintln(d.Stderr, "git worktree add:", err)
 		return 1
 	}
+	return adoptWorktree(adoptOpts{Branch: o.Branch, Path: path, SkipInit: o.SkipInit, Verb: "created"}, d)
+}
+
+type adoptOpts struct {
+	Branch   string
+	Path     string // the worktree's absolute path (already checked out)
+	SkipInit bool
+	Verb     string // past-tense verb for the success line (default "adopted")
+}
+
+// adoptWorktree prepares an existing worktree: DB fork → copy → init.
+// It never touches git, so it works on worktrees created by other tools
+// (e.g. an Orca setup hook) as well as on `dx worktree create`'s own.
+// Idempotent: an existing DB is not re-forked, existing copy destinations are
+// kept, and init steps re-run.
+// 0=ready, 3=a follow-up step failed (worktree kept), 1=abort.
+func adoptWorktree(o adoptOpts, d wtDeps) int {
+	verb := o.Verb
+	if verb == "" {
+		verb = "adopted"
+	}
+	// collision (DB name) check against the *other* worktrees — the target
+	// itself is expected to be in the list.
+	if with, ok := worktree.SlugCollision(o.Branch, otherBranches(d.Existing, o.Branch)); ok {
+		fmt.Fprintf(d.Stderr, "branch %q collides with existing worktree %q on db/portless name\n", o.Branch, with)
+		return 1
+	}
 	// DB fork (prepared). Only when [db] declared.
 	if d.Cfg.DB.SQLite() {
 		s := db.SQLite{Path: d.Cfg.DB.Path}
-		if err := s.Seed(d.Docker, d.PrimaryRoot, path); err != nil {
-			fmt.Fprintln(d.Stderr, "worktree created but db seed failed:", err)
+		if err := s.Seed(d.Docker, d.PrimaryRoot, o.Path); err != nil {
+			fmt.Fprintln(d.Stderr, "db seed failed (worktree kept):", err)
 			return 3
 		}
-		fmt.Fprintf(d.Stdout, "created %s (branch=%s db=%s)\n", path, o.Branch, d.Cfg.DB.Path)
+		fmt.Fprintf(d.Stdout, "%s %s (branch=%s db=%s)\n", verb, o.Path, o.Branch, d.Cfg.DB.Path)
 	} else if d.Cfg.DB != nil {
 		raw := d.Cfg.DB.Dsn
 		if raw == "" {
 			raw = d.Getenv(d.Cfg.DB.URLEnv)
 		}
 		if raw == "" {
-			fmt.Fprintf(d.Stderr, "url_env %q not set; skipping db fork (cd into the worktree and run `dx db fork`)\n", d.Cfg.DB.URLEnv)
+			fmt.Fprintf(d.Stderr, "url_env %q not set; skipping db fork (run `dx db fork` in the worktree)\n", d.Cfg.DB.URLEnv)
 			return 3
 		}
 		dsn, err := dburl.Parse(raw)
@@ -94,18 +123,18 @@ func createWorktree(o createOpts, d wtDeps) int {
 		target := worktree.DBName(dsn.Name, o.Branch, false)
 		c := db.Container{Name: d.Cfg.DB.Container, Image: d.Cfg.DB.Image, Volume: d.Cfg.DB.Volume, DSN: dsn}
 		if err := c.Fork(d.Docker, dsn.Name, target); err != nil {
-			fmt.Fprintln(d.Stderr, "worktree created but db fork failed:", err)
+			fmt.Fprintln(d.Stderr, "db fork failed (worktree kept):", err)
 			return 3
 		}
-		fmt.Fprintf(d.Stdout, "created %s (branch=%s db=%s)\n", path, o.Branch, target)
+		fmt.Fprintf(d.Stdout, "%s %s (branch=%s db=%s)\n", verb, o.Path, o.Branch, target)
 	} else {
-		fmt.Fprintf(d.Stdout, "created %s (branch=%s, no db)\n", path, o.Branch)
+		fmt.Fprintf(d.Stdout, "%s %s (branch=%s, no db)\n", verb, o.Path, o.Branch)
 	}
 
 	// copy steps (after DB fork, before init). fail-fast → rc 3.
 	if len(d.Cfg.Worktree.Copy) > 0 && d.RunCopy != nil {
-		if err := d.RunCopy(d.Cfg.Worktree.Copy, d.PrimaryRoot, path, d.Stdout, d.Stderr); err != nil {
-			fmt.Fprintln(d.Stderr, "worktree created but copy failed:", err)
+		if err := d.RunCopy(d.Cfg.Worktree.Copy, d.PrimaryRoot, o.Path, d.Stdout, d.Stderr); err != nil {
+			fmt.Fprintln(d.Stderr, "copy failed (worktree kept):", err)
 			return 3
 		}
 	}
@@ -117,13 +146,51 @@ func createWorktree(o createOpts, d wtDeps) int {
 			return 0
 		}
 		if d.RunInit != nil {
-			if err := d.RunInit(d.Cfg.Worktree.Init, path, o.Branch, d.PrimaryRoot, d.Stdout, d.Stderr); err != nil {
-				fmt.Fprintln(d.Stderr, "worktree created but init failed:", err)
+			if err := d.RunInit(d.Cfg.Worktree.Init, o.Path, o.Branch, d.PrimaryRoot, d.Stdout, d.Stderr); err != nil {
+				fmt.Fprintln(d.Stderr, "init failed (worktree kept):", err)
 				return 3
 			}
 		}
 	}
 	return 0
+}
+
+// otherBranches returns existing without branch itself.
+func otherBranches(existing []string, branch string) []string {
+	var out []string
+	for _, e := range existing {
+		if e != branch {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// primaryRootFrom returns the primary checkout root: the first entry of
+// `git worktree list --porcelain`. Works from a linked worktree, which is
+// where `dx worktree adopt` runs.
+func primaryRootFrom(git func(args ...string) (string, error)) (string, error) {
+	out, err := git("worktree", "list", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	rows := parseWorktreePorcelain(out)
+	if len(rows) == 0 || rows[0].Path == "" {
+		return "", fmt.Errorf("cannot determine the primary checkout from `git worktree list`")
+	}
+	return rows[0].Path, nil
+}
+
+// worktreePathFor looks up a branch's checkout path in porcelain output.
+// Worktrees created outside dx do not live at <primary>/<worktree.dir>/<branch>,
+// so the path must be read from git rather than computed.
+func worktreePathFor(porc, branch string) (string, bool) {
+	for _, r := range parseWorktreePorcelain(porc) {
+		if r.Branch == branch && !r.IsPrimary {
+			return r.Path, true
+		}
+	}
+	return "", false
 }
 
 // existingWorktreeBranches parses `git worktree list --porcelain` for branch names
@@ -156,10 +223,16 @@ func branchExists(git func(args ...string) (string, error), branch string) bool 
 }
 
 type rmOpts struct {
-	Branch       string
+	Branch string
+	// Path is the worktree's checkout path. Empty falls back to the
+	// configured <primary>/<worktree.dir>/<branch> layout.
+	Path         string
 	Force        bool
 	KeepDB       bool
 	DeleteBranch bool
+	// KeepWorktree stops services and drops the DB but leaves the checkout
+	// and the branch alone (for an external tool that removes them itself).
+	KeepWorktree bool
 }
 
 type rmDeps struct {
@@ -224,11 +297,15 @@ func listRows(cfg *project.Config, baseDB, porc string, serviceState func(svcNam
 // rmWorktree performs `dx worktree rm`.
 // All abort-able preconditions run first (no side effects), then destructive actions.
 func rmWorktree(o rmOpts, d rmDeps) int {
-	path := filepath.Join(d.PrimaryRoot, d.Cfg.Worktree.Dir, o.Branch)
+	path := o.Path
+	if path == "" {
+		path = filepath.Join(d.PrimaryRoot, d.Cfg.Worktree.Dir, o.Branch)
+	}
 
 	// --- Preconditions (no side effects) ---
-	// 1a. dirty check
-	if d.Dirty(path) && !o.Force {
+	// 1a. dirty check. Skipped with --keep-worktree: the checkout survives, so
+	// there is no uncommitted work to protect.
+	if !o.KeepWorktree && d.Dirty(path) && !o.Force {
 		fmt.Fprintln(d.Stderr, "worktree has changes; use --force")
 		return 1
 	}
@@ -274,6 +351,10 @@ func rmWorktree(o rmOpts, d rmDeps) int {
 			return 1
 		}
 	}
+	if o.KeepWorktree {
+		fmt.Fprintf(d.Stdout, "cleaned %s (branch=%s, worktree kept)\n", path, o.Branch)
+		return 0
+	}
 	// 2c. git worktree remove
 	rmArgs := []string{"worktree", "remove", path}
 	if o.Force {
@@ -310,23 +391,61 @@ func parseWorktreeArgs(fs *flag.FlagSet, rest []string) (string, error) {
 	return branch, nil
 }
 
-// runWorktree dispatches `dx worktree <create|rm|list>` with real git/docker runners.
+// parseRmArgs parses `rm` flags and rejects contradictory combinations.
+func parseRmArgs(rest []string) (rmOpts, error) {
+	fs := flag.NewFlagSet("rm", flag.ContinueOnError)
+	force := fs.Bool("force", false, "remove even if dirty")
+	keepDB := fs.Bool("keep-db", false, "skip DB drop")
+	keepWorktree := fs.Bool("keep-worktree", false, "keep the checkout and branch (stop services + drop DB only)")
+	delBranch := fs.Bool("delete-branch", false, "also delete the git branch")
+	branch, err := parseWorktreeArgs(fs, rest)
+	if err != nil {
+		return rmOpts{}, err
+	}
+	if *keepWorktree && *delBranch {
+		return rmOpts{}, fmt.Errorf("--keep-worktree cannot be combined with --delete-branch")
+	}
+	return rmOpts{
+		Branch: branch, Force: *force, KeepDB: *keepDB,
+		DeleteBranch: *delBranch, KeepWorktree: *keepWorktree,
+	}, nil
+}
+
+// parseAdoptArgs parses `adopt` flags. adopt targets the current worktree, so
+// it takes no positional argument.
+func parseAdoptArgs(rest []string) (bool, error) {
+	fs := flag.NewFlagSet("adopt", flag.ContinueOnError)
+	skipInit := fs.Bool("skip-init", false, "skip [[worktree.init]] steps")
+	if err := fs.Parse(rest); err != nil {
+		return false, err
+	}
+	if fs.NArg() > 0 {
+		return false, fmt.Errorf("unexpected argument %q (adopt runs on the current worktree)", fs.Arg(0))
+	}
+	return *skipInit, nil
+}
+
+// runWorktree dispatches `dx worktree <create|adopt|rm|list>` with real git/docker runners.
 func runWorktree(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: dx worktree <create|rm|list> ...")
+		fmt.Fprintln(stderr, "usage: dx worktree <create|adopt|rm|list> ...")
 		return 2
 	}
 	sub, rest := args[0], args[1:]
 
-	// All worktree commands run from the primary checkout.
 	wt, err := worktree.Detect(".", gitRun("."))
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if !wt.IsPrimary {
+	// Most worktree commands run from the primary checkout; `adopt` runs inside
+	// a worktree and `rm --keep-worktree` accepts either.
+	requirePrimary := func() bool {
+		if wt.IsPrimary {
+			return true
+		}
 		fmt.Fprintln(stderr, "run from the primary checkout")
-		return 1
+		return false
 	}
 	cfg, err := project.Load(filepath.Join(wt.Toplevel, "dx.toml"))
 	if err != nil {
@@ -337,10 +456,14 @@ func runWorktree(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	primaryGit := gitRun(wt.Toplevel)
+	// git runs from this checkout; `worktree list` reports every checkout regardless.
+	gitCmd := gitRun(wt.Toplevel)
 
 	switch sub {
 	case "create":
+		if !requirePrimary() {
+			return 1
+		}
 		fs := flag.NewFlagSet("create", flag.ContinueOnError)
 		from := fs.String("from", "", "branch start point")
 		skipInit := fs.Bool("skip-init", false, "skip [[worktree.init]] steps")
@@ -349,11 +472,11 @@ func runWorktree(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "usage: dx worktree create <branch> [--from <base>] [--skip-init]")
 			return 2
 		}
-		existing, _ := existingWorktreeBranches(primaryGit)
+		existing, _ := existingWorktreeBranches(gitCmd)
 		return createWorktree(createOpts{Branch: branch, From: *from, SkipInit: *skipInit}, wtDeps{
 			Cfg: cfg, PrimaryRoot: wt.Toplevel, Existing: existing,
-			Git:              primaryGit,
-			BranchExists:     func(b string) bool { return branchExists(primaryGit, b) },
+			Git:              gitCmd,
+			BranchExists:     func(b string) bool { return branchExists(gitCmd, b) },
 			ContainerRunning: containerRunning,
 			Docker:           dockerRunner,
 			Getenv:           os.Getenv,
@@ -362,18 +485,35 @@ func runWorktree(args []string, stdout, stderr io.Writer) int {
 			Stdout:           stdout, Stderr: stderr,
 		})
 	case "rm":
-		fs := flag.NewFlagSet("rm", flag.ContinueOnError)
-		force := fs.Bool("force", false, "remove even if dirty")
-		keepDB := fs.Bool("keep-db", false, "skip DB drop")
-		delBranch := fs.Bool("delete-branch", false, "also delete the git branch")
-		branch, err := parseWorktreeArgs(fs, rest)
+		o, err := parseRmArgs(rest)
 		if err != nil {
-			fmt.Fprintln(stderr, "usage: dx worktree rm <branch> [--force] [--keep-db] [--delete-branch]")
+			fmt.Fprintln(stderr, err)
+			fmt.Fprintln(stderr, "usage: dx worktree rm <branch> [--force] [--keep-db] [--keep-worktree] [--delete-branch]")
 			return 2
 		}
-		return rmWorktree(rmOpts{Branch: branch, Force: *force, KeepDB: *keepDB, DeleteBranch: *delBranch}, rmDeps{
-			Cfg: cfg, PrimaryRoot: wt.Toplevel,
-			Git:    primaryGit,
+		// Removing a worktree from inside itself cannot work; --keep-worktree
+		// leaves the checkout alone, so it is allowed there (archive hooks).
+		if !wt.IsPrimary && !o.KeepWorktree {
+			fmt.Fprintln(stderr, "run from the primary checkout (or use --keep-worktree)")
+			return 1
+		}
+		primaryRoot := wt.Toplevel
+		if !wt.IsPrimary {
+			primaryRoot, err = primaryRootFrom(gitCmd)
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return 1
+			}
+		}
+		// A worktree created outside dx does not live at the configured path.
+		if porc, gerr := gitCmd("worktree", "list", "--porcelain"); gerr == nil {
+			if p, ok := worktreePathFor(porc, o.Branch); ok {
+				o.Path = p
+			}
+		}
+		return rmWorktree(o, rmDeps{
+			Cfg: cfg, PrimaryRoot: primaryRoot,
+			Git:    gitCmd,
 			Docker: dockerRunner,
 			Getenv: os.Getenv,
 			StopServices: func(top string) error {
@@ -393,7 +533,38 @@ func runWorktree(args []string, stdout, stderr io.Writer) int {
 			},
 			Stdout: stdout, Stderr: stderr,
 		})
+	case "adopt":
+		skipInit, err := parseAdoptArgs(rest)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			fmt.Fprintln(stderr, "usage: dx worktree adopt [--skip-init]")
+			return 2
+		}
+		if wt.IsPrimary {
+			fmt.Fprintln(stderr, "run from inside the worktree (from the primary use `dx worktree create`)")
+			return 1
+		}
+		primaryRoot, err := primaryRootFrom(gitCmd)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		existing, _ := existingWorktreeBranches(gitCmd)
+		return adoptWorktree(adoptOpts{Branch: wt.Branch, Path: wt.Toplevel, SkipInit: skipInit}, wtDeps{
+			Cfg: cfg, PrimaryRoot: primaryRoot, Existing: existing,
+			Git:              gitCmd,
+			BranchExists:     func(b string) bool { return branchExists(gitCmd, b) },
+			ContainerRunning: containerRunning,
+			Docker:           dockerRunner,
+			Getenv:           os.Getenv,
+			RunCopy:          runCopySteps,
+			RunInit:          runInitSteps,
+			Stdout:           stdout, Stderr: stderr,
+		})
 	case "list":
+		if !requirePrimary() {
+			return 1
+		}
 		asJSON := false
 		for _, a := range rest {
 			if a == "--json" {

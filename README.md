@@ -5,7 +5,7 @@ A developer-experience CLI that wraps [portless](https://portless.sh) and Docker
 - **Stable HTTPS URLs** for every dev service (`https://api.localhost`) via portless — no port juggling
 - **One command** (`dx up`) starts your whole stack in the background, idempotently
 - **Unified logs** (`dx logs -f`) — every service in one stream, colored per service, with a clean ANSI-free file for grep/AI
-- **Git worktree lifecycle** (`dx worktree create/rm`) — each branch gets its own worktree, its own Postgres database (forked from the primary), and its own URL namespace (`api-<branch>.localhost`)
+- **Git worktree lifecycle** (`dx worktree create/adopt/rm`) — each branch gets its own worktree, its own Postgres database (forked from the primary), and its own URL namespace (`api-<branch>.localhost`). `adopt` applies the same setup to a worktree another tool created.
 - **Cross-service URL injection** — declare `VITE_API_URL = "api"` in `dx.toml` and every checkout gets the right URL automatically
 - **Raycast extension** (optional) to list / open / stop services
 
@@ -160,10 +160,10 @@ Services are declared as `[service.<key>]` map entries. The key is used:
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `worktree.dir` | string | optional (default `.claude/worktrees`) | Worktree placement dir, relative to primary root |
-| `worktree.copy` | array of tables | optional | Files/dirs seeded from the primary checkout into a new worktree, before init. Missing source → skipped; existing destination → skipped (no overwrite); symlinks preserved. |
+| `worktree.dir` | string | optional (default `.claude/worktrees`) | Worktree placement dir for `create`, relative to primary root. Not used by `adopt`, which takes the worktree where it finds it. |
+| `worktree.copy` | array of tables | optional | Files/dirs seeded from the primary checkout into a new worktree by `create`/`adopt`, before init. Missing source → skipped; existing destination → skipped (no overwrite); symlinks preserved. |
 | `worktree.copy[].from` | string | required | Source relative to primary root; also the destination path in the new worktree. |
-| `worktree.init` | array of tables | optional | Commands run after `dx worktree create` succeeds (after DB fork and copy), in order, fail-fast. Child env adds `DX_WORKTREE_BRANCH` / `DX_WORKTREE_PATH` / `DX_PRIMARY_ROOT`. |
+| `worktree.init` | array of tables | optional | Commands run after `dx worktree create`/`adopt` succeeds (after DB fork and copy), in order, fail-fast. Child env adds `DX_WORKTREE_BRANCH` / `DX_WORKTREE_PATH` / `DX_PRIMARY_ROOT`. |
 | `worktree.init[].command` | string array | required | argv. Shell is not involved. |
 | `worktree.init[].dir` | string | optional (default: worktree root) | Working dir relative to the new worktree root. Must be relative and stay inside the worktree (no absolute paths, no `..`). |
 | `db` | table | optional | Omit if no managed DB |
@@ -302,7 +302,7 @@ Run any command in a service's environment: the same env `dx serve` injects (pub
 
 ### `dx worktree <subcommand>` (alias: `dx wt`)
 
-Manage the full lifecycle of git worktrees: create, remove, and list. All worktree subcommands must be run from the **primary checkout**. `wt` works everywhere `worktree` does (e.g. `dx wt create feat-x`).
+Manage the full lifecycle of git worktrees: create, adopt, remove, and list. Worktree subcommands run from the **primary checkout**, with two exceptions: `adopt` runs from inside the worktree, and `rm --keep-worktree` accepts either. `wt` works everywhere `worktree` does (e.g. `dx wt create feat-x`).
 
 #### `dx worktree create <branch> [--from <base-branch>] [--skip-init]`
 
@@ -322,19 +322,52 @@ Each init step runs in the new worktree root (or `<root>/<dir>` when `dir` is se
 
 After a successful `create`, start services with `dx up` from inside the new worktree (or `dx serve <name>`).
 
-#### `dx worktree rm <branch> [--force] [--keep-db] [--delete-branch]`
+#### `dx worktree adopt [--skip-init]`
 
-Stop services, drop the worktree DB, and remove the git worktree — in that order. All precondition checks run before any destructive action.
+Everything `create` does except `git worktree add`: fork the DB, seed `[[worktree.copy]]` files, then run the `[[worktree.init]]` steps — against the worktree you are standing in. This is for worktrees created by another tool, so that `dx.toml` remains the single source of truth for what a prepared worktree looks like (see [External worktree tools](#external-worktree-tools)).
+
+Runs from inside the worktree only and takes no branch argument — the current branch is the target. The worktree may live anywhere; the primary checkout is resolved from `git worktree list`, so `[[worktree.copy]]` sources still come from the primary root. Exit codes and `--skip-init` match `create`.
+
+**Idempotent** — safe to re-run from a hook that fires more than once: an existing DB is not re-forked, existing copy destinations are left untouched, and init steps re-run.
+
+```bash
+cd /anywhere/my-worktree   # created by git worktree add, or by another tool
+dx worktree adopt
+```
+
+#### `dx worktree rm <branch> [--force] [--keep-db] [--keep-worktree] [--delete-branch]`
+
+Stop services, drop the worktree DB, and remove the git worktree — in that order. All precondition checks run before any destructive action. The worktree's path is read from `git worktree list`, so worktrees that do not live under `<worktree.dir>` are handled correctly.
 
 | Flag | Description |
 |------|-------------|
 | `--force` | Remove even if the worktree has uncommitted changes |
 | `--keep-db` | Skip DB drop |
+| `--keep-worktree` | Stop services and drop the DB only; leave the checkout and the branch in place. For a tool that removes them itself. Skips the dirty check (nothing is destroyed), and is the one form of `rm` that also runs from inside the worktree. Cannot be combined with `--delete-branch`. |
 | `--delete-branch` | Also run `git branch -d <branch>` after removal |
+
+`--keep-db` and `--keep-worktree` are orthogonal: `--keep-worktree` alone drops the DB and keeps the files; both together stop services and nothing else.
 
 #### `dx worktree list [--json]`
 
 Show all git worktrees with their DB status and service states side by side.
+
+#### External worktree tools
+
+Some tools (e.g. Orca) create and delete worktrees with their own built-in git operations and cannot be pointed at `dx worktree create`. They do, however, run a setup hook after creating a worktree and an archive hook before deleting one. `adopt` and `rm --keep-worktree` are the halves of the lifecycle that pair with those hooks, so the tool keeps ownership of the git operations while `dx.toml` keeps ownership of the DB fork, the copy steps, and the init steps:
+
+```yaml
+scripts:
+  setup: |
+    set -euo pipefail
+    export PATH="$HOME/.local/bin:$PATH"
+    dx worktree adopt
+  archive: |
+    export PATH="$HOME/.local/bin:$PATH"
+    dx worktree rm "$(git branch --show-current)" --keep-worktree
+```
+
+dx keeps no worktree registry — the DB name and the service names are derived from the current git branch — so a worktree created this way behaves like any other: `dx db url` returns the right DB, and `dx worktree list` shows it.
 
 ### `dx raycast <install|uninstall>`
 
